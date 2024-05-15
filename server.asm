@@ -1,14 +1,20 @@
 bits 64
 
+; Used to convert the port number to big endian when assembling
+
 %define  swap_word(x)  ( (x<<8) | ((x&0xFFFF)>>>8) )
 
 section .text
+
+; Params
 
 HTTP_PORT EQU 8080
 BACKLOG EQU 5
 STDOUT EQU 1
 BUFFER_LEN EQU 200
 FILE_BUFFER_LEN EQU 1000
+
+; Syscall constants
 
 AF_INET EQU 2
 SOCK_STREAM EQU 1
@@ -34,22 +40,25 @@ SO_REUSEADDR EQU 2
 
 global _start
 _start:
-    ; Create a socket
+    ; Create a socket, fd will be stored in RBX
     mov rax, SYS_SOCKET
     mov rdi, AF_INET
     mov rsi, SOCK_STREAM
     mov rdx, 0
     syscall
     ; RAX now contains fd
+    ; Move it to RBX to avoid clobbering
     mov rbx, rax
-    cmp rax, -1
+    cmp rax, -1 ; Check for failure
     jne .no_sock_err
 .sock_err:
+    ; Print errors and die
     mov rax, socket_error_msg
     call print_text
     mov rax, 1
     call exit
 .no_sock_err:
+    ; Set socket reuse addr flag so we can restart more quickly (no 30-120 second downtime between starts)
     mov rax, SYS_SETSOCKOPT
     mov rdi, rbx
     mov rsi, SOL_SOCKET
@@ -64,6 +73,7 @@ _start:
     syscall
     cmp rax, 0
     jne .sock_err ; Failed to bind
+    ; Listen on socket
     mov rax, SYS_LISTEN
     mov rdi, rbx
     mov rsi, BACKLOG
@@ -73,18 +83,19 @@ _start:
     mov rax, bind_success_msg
     call print_text
 .accept:
+    ; Accept an incoming connection
     mov rax, SYS_ACCEPT
     mov rdi, rbx
     mov rsi, client_sock
     mov rdx, client_addrlen
     syscall
-    cmp rax, 0
+    cmp rax, 0 ; Client socket fd is in RAX
     jl .accept_error
-    push rax
+    push rax ; Print new connection message
     mov rax, accept_success_msg
     call print_text
     pop rax
-    push rax
+    push rax ; Read HTTP request into buffer
     mov rcx, rax
     mov rax, SYS_READ
     mov rdi, rcx
@@ -99,7 +110,8 @@ _start:
     call print_text
     jmp .accept
 
-handle_request: ; GET /test.txt HTTP 1.1
+handle_request: ; RAX contains client file descriptor
+    ; GET /test.txt HTTP 1.1
     push r8
     mov r8, rax
     push rax
@@ -110,6 +122,7 @@ handle_request: ; GET /test.txt HTTP 1.1
     mov rax, -1 ; RAX sentinel
     mov rbx, input_buffer
     mov rcx, 0
+    ; This loops through the buffer until it finds the first space, then substrings that until the next space/EOL
 .request_loop:
     cmp rax, -1
     jne .request_find_end
@@ -130,6 +143,7 @@ handle_request: ; GET /test.txt HTTP 1.1
     je .request_found_end
     jmp .request_loop_inc
 .request_found_end:
+    ; Zero terminates the end of the requested file
     mov rbx, input_buffer
     add rbx, rax
     sub rcx, rax
@@ -141,9 +155,10 @@ handle_request: ; GET /test.txt HTTP 1.1
     push r11
     mov r11b, 0x0
     mov [rdx], r11b
+
     pop r11
     pop rdx
-    call process_get
+    call process_get ; Run the routine to actually fetch a file
     pop rdx
     pop rcx
     pop rbx
@@ -178,22 +193,23 @@ process_get: ; Takes string in RAX, length in RBX, and file handle in R8
     push r11
     push r12
     mov r9, rax
-    mov rax, get_message
+    mov rax, get_message ; Print message with request details
     call print_text
     mov rax, r9
     call print_text
     mov rax, newline
     call print_text
-    mov r10, rbx
+    mov r10, rbx ; Try to open file
     mov rax, SYS_OPEN
     mov rdi, r9
     mov rsi, O_RDONLY
     mov rdx, 0
     syscall
     cmp rax, 0
-    jl .get_404
-    mov r12, rax
+    jl .get_404 ; File doesn't exist, send 404
+    mov r12, rax ; Move file descriptor to r12 to avoid clobbering
 
+    ; Seek to end of file to find its length
     mov rax, SYS_LSEEK
     mov rdi, r12
     mov rsi, 0 ; 0 offset
@@ -206,6 +222,8 @@ process_get: ; Takes string in RAX, length in RBX, and file handle in R8
     mov rsi, 0
     mov rdx, SEEK_SET
     syscall
+
+    ; Send start of HTTP 200 response
     mov rax, http_response_200
     call strlen
     mov rdx, rax
@@ -213,7 +231,7 @@ process_get: ; Takes string in RAX, length in RBX, and file handle in R8
     mov rdi, r8
     mov rax, SYS_WRITE
     syscall
-.get_read:
+.get_read: ; Loop through the file and read a buffer's worth of data
     mov rax, SYS_READ
     mov rdi, r12
     mov rsi, file_buffer
@@ -222,7 +240,7 @@ process_get: ; Takes string in RAX, length in RBX, and file handle in R8
     pop r11
     sub r11, rax
     push r11
-    mov rdx, rax
+    mov rdx, rax ; Write the data to the socket
     mov rsi, file_buffer
     mov rdi, r8
     mov rax, SYS_WRITE
@@ -231,14 +249,14 @@ process_get: ; Takes string in RAX, length in RBX, and file handle in R8
     cmp r11, 0
     push r11
     jg .get_read
-    pop r11
+    pop r11 ; Close open file
     mov rax, SYS_CLOSE
     mov rdi, r12
     syscall
 
     jmp .get_end
 .get_404:
-    mov rax, http_response_404
+    mov rax, http_response_404 ; Send premade 404 response
     call strlen
     mov rdx, rax
     mov rsi, http_response_404
@@ -246,7 +264,7 @@ process_get: ; Takes string in RAX, length in RBX, and file handle in R8
     mov rdi, r8
     syscall
 .get_end:
-    mov rax, SYS_CLOSE
+    mov rax, SYS_CLOSE ; Close socket to trigger end of request
     mov rdi, r8
     syscall
     pop r12
@@ -261,7 +279,7 @@ process_get: ; Takes string in RAX, length in RBX, and file handle in R8
     pop rax
     ret
 
-strlen: ; Buffer location in RAX
+strlen: ; Buffer location in RAX. Counts the number of bytes in a string up until a null terminator
     push rbx
     push rcx
     push rdx
@@ -280,7 +298,7 @@ strlen: ; Buffer location in RAX
     pop rbx
     ret
 
-print_withlen: ; Buffer location in RAX, length in RBX
+print_withlen: ; Buffer location in RAX, length in RBX. Prints a string with a given length to console
     push rdi
     push rsi
     push rdx
@@ -298,7 +316,7 @@ print_withlen: ; Buffer location in RAX, length in RBX
     pop rdi
     ret
 
-print_text: ; Buffer location in RAX
+print_text: ; Buffer location in RAX. Prints a null terminated string to console
     push rbx
     push rax
 
@@ -311,7 +329,7 @@ print_text: ; Buffer location in RAX
     pop rbx
     ret
 
-exit: ; Error code in RAX
+exit: ; Error code in RAX. Exits the program
     mov rdi, rax
     mov rax, SYS_EXIT
     syscall
